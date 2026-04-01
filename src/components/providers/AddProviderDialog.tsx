@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
-import type { Provider, CustomEndpoint, UniversalProvider } from "@/types";
+import type { Provider, UniversalProvider } from "@/types";
 import type { AppId } from "@/lib/api";
 import { universalProvidersApi } from "@/lib/api";
 import {
@@ -17,9 +17,9 @@ import { UniversalProviderPanel } from "@/components/universal";
 import { providerPresets } from "@/config/claudeProviderPresets";
 import { codexProviderPresets } from "@/config/codexProviderPresets";
 import { geminiProviderPresets } from "@/config/geminiProviderPresets";
-import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 import type { OpenClawSuggestedDefaults } from "@/config/openclawProviderPresets";
 import type { UniversalProviderPreset } from "@/config/universalProviderPresets";
+import { finalizeProviderSubmission } from "@/utils/providerSubmission";
 
 interface AddProviderDialogProps {
   open: boolean;
@@ -112,124 +112,32 @@ export function AddProviderDialog({
         providerData.providerKey = values.providerKey;
       }
 
-      const hasCustomEndpoints =
-        providerData.meta?.custom_endpoints &&
-        Object.keys(providerData.meta.custom_endpoints).length > 0;
-
-      if (!hasCustomEndpoints && values.presetCategory !== "omo") {
-        const urlSet = new Set<string>();
-
-        const addUrl = (rawUrl?: string) => {
-          const url = (rawUrl || "").trim().replace(/\/+$/, "");
-          if (url && url.startsWith("http")) {
-            urlSet.add(url);
-          }
-        };
-
-        if (values.presetId) {
-          if (appId === "claude") {
-            const presets = providerPresets;
-            const presetIndex = parseInt(
-              values.presetId.replace("claude-", ""),
-            );
-            if (
-              !isNaN(presetIndex) &&
-              presetIndex >= 0 &&
-              presetIndex < presets.length
-            ) {
-              const preset = presets[presetIndex];
-              if (preset?.endpointCandidates) {
-                preset.endpointCandidates.forEach(addUrl);
-              }
-            }
-          } else if (appId === "codex") {
-            const presets = codexProviderPresets;
-            const presetIndex = parseInt(values.presetId.replace("codex-", ""));
-            if (
-              !isNaN(presetIndex) &&
-              presetIndex >= 0 &&
-              presetIndex < presets.length
-            ) {
-              const preset = presets[presetIndex];
-              if (Array.isArray(preset.endpointCandidates)) {
-                preset.endpointCandidates.forEach(addUrl);
-              }
-            }
-          } else if (appId === "gemini") {
-            const presets = geminiProviderPresets;
-            const presetIndex = parseInt(
-              values.presetId.replace("gemini-", ""),
-            );
-            if (
-              !isNaN(presetIndex) &&
-              presetIndex >= 0 &&
-              presetIndex < presets.length
-            ) {
-              const preset = presets[presetIndex];
-              if (Array.isArray(preset.endpointCandidates)) {
-                preset.endpointCandidates.forEach(addUrl);
-              }
-            }
-          }
-        }
-
-        if (appId === "claude") {
-          const env = parsedConfig.env as Record<string, any> | undefined;
-          if (env?.ANTHROPIC_BASE_URL) {
-            addUrl(env.ANTHROPIC_BASE_URL);
-          }
-        } else if (appId === "codex") {
-          const config = parsedConfig.config as string | undefined;
-          if (config) {
-            const extractedBaseUrl = extractCodexBaseUrl(config);
-            if (extractedBaseUrl) {
-              addUrl(extractedBaseUrl);
-            }
-          }
-        } else if (appId === "gemini") {
-          const env = parsedConfig.env as Record<string, any> | undefined;
-          if (env?.GOOGLE_GEMINI_BASE_URL) {
-            addUrl(env.GOOGLE_GEMINI_BASE_URL);
-          }
-        } else if (appId === "opencode") {
-          const options = parsedConfig.options as
-            | Record<string, any>
-            | undefined;
-          if (options?.baseURL) {
-            addUrl(options.baseURL);
-          }
-        } else if (appId === "openclaw") {
-          // OpenClaw uses baseUrl directly
-          if (parsedConfig.baseUrl) {
-            addUrl(parsedConfig.baseUrl as string);
-          }
-        }
-
-        const urls = Array.from(urlSet);
-        if (urls.length > 0) {
-          const now = Date.now();
-          const customEndpoints: Record<string, CustomEndpoint> = {};
-          urls.forEach((url) => {
-            customEndpoints[url] = {
-              url,
-              addedAt: now,
-              lastUsed: undefined,
-            };
-          });
-
-          providerData.meta = {
-            ...(providerData.meta ?? {}),
-            custom_endpoints: customEndpoints,
-          };
-        }
-      }
-
       // OpenClaw: pass suggestedDefaults for model registration
       if (appId === "openclaw" && values.suggestedDefaults) {
         providerData.suggestedDefaults = values.suggestedDefaults;
       }
 
-      await onSubmit(providerData);
+      let presetEndpointCandidates: string[] | undefined;
+
+      if (values.presetId) {
+        if (appId === "claude") {
+          const presetIndex = parseInt(values.presetId.replace("claude-", ""));
+          presetEndpointCandidates = providerPresets[presetIndex]?.endpointCandidates;
+        } else if (appId === "codex") {
+          const presetIndex = parseInt(values.presetId.replace("codex-", ""));
+          presetEndpointCandidates = codexProviderPresets[presetIndex]?.endpointCandidates;
+        } else if (appId === "gemini") {
+          const presetIndex = parseInt(values.presetId.replace("gemini-", ""));
+          presetEndpointCandidates =
+            geminiProviderPresets[presetIndex]?.endpointCandidates;
+        }
+      }
+
+      await onSubmit(
+        finalizeProviderSubmission(appId, providerData, {
+          presetEndpointCandidates,
+        }),
+      );
       onOpenChange(false);
     },
     [appId, onSubmit, onOpenChange],

@@ -24,7 +24,12 @@ import {
 } from "lucide-react";
 import type { Provider, VisibleApps } from "@/types";
 import type { EnvConflict } from "@/types/env";
-import { useProvidersQuery, useSettingsQuery } from "@/lib/query";
+import {
+  useAddProviderMutation,
+  useUpdateProviderMutation,
+  useProvidersQuery,
+  useSettingsQuery,
+} from "@/lib/query";
 import {
   providersApi,
   settingsApi,
@@ -38,12 +43,18 @@ import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { useAutoCompact } from "@/hooks/useAutoCompact";
 import { useLastValidValue } from "@/hooks/useLastValidValue";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import {
+  buildBatchProviderUpdate,
+  findMatchingBatchProvider,
+  isSameBatchProviderContent,
+} from "@/utils/providerSubmission";
 import { isTextEditableTarget } from "@/utils/domUtils";
 import { cn } from "@/lib/utils";
 import { isWindows, isLinux } from "@/lib/platform";
 import { AppSwitcher } from "@/components/AppSwitcher";
 import { ProviderList } from "@/components/providers/ProviderList";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
+import { BatchAddProvidersDialog } from "@/components/providers/BatchAddProvidersDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SettingsPage } from "@/components/settings/SettingsPage";
@@ -147,6 +158,7 @@ function App() {
   const [currentView, setCurrentView] = useState<View>(getInitialView);
   const [settingsDefaultTab, setSettingsDefaultTab] = useState("general");
   const [isAddOpen, setIsAddOpen] = useState(false);
+  const [isBatchAddOpen, setIsBatchAddOpen] = useState(false);
 
   useEffect(() => {
     localStorage.setItem(VIEW_STORAGE_KEY, currentView);
@@ -228,6 +240,12 @@ function App() {
   const { data, isLoading, refetch } = useProvidersQuery(activeApp, {
     isProxyRunning,
   });
+  const { data: claudeProvidersData } = useProvidersQuery("claude", {
+    isProxyRunning,
+  });
+  const { data: codexProvidersData } = useProvidersQuery("codex", {
+    isProxyRunning,
+  });
   const providers = useMemo(() => data?.providers ?? {}, [data]);
   const currentProviderId = data?.currentProviderId ?? "";
   const isOpenClawView =
@@ -256,6 +274,59 @@ function App() {
     saveUsageScript,
     setAsDefaultModel,
   } = useProviderActions(activeApp, isProxyRunning);
+  const addClaudeProviderMutation = useAddProviderMutation("claude");
+  const addCodexProviderMutation = useAddProviderMutation("codex");
+  const updateClaudeProviderMutation = useUpdateProviderMutation("claude");
+  const updateCodexProviderMutation = useUpdateProviderMutation("codex");
+
+  const addBatchProvider = async (
+    appId: AppId,
+    provider: Omit<Provider, "id"> & {
+      providerKey?: string;
+    },
+  ) => {
+    const existingProviders =
+      appId === "claude"
+        ? claudeProvidersData?.providers ?? {}
+        : appId === "codex"
+          ? codexProvidersData?.providers ?? {}
+          : {};
+    const matchedProvider = findMatchingBatchProvider(
+      appId,
+      existingProviders,
+      provider,
+    );
+
+    if (appId === "claude") {
+      if (matchedProvider) {
+        if (isSameBatchProviderContent(matchedProvider, provider)) {
+          return;
+        }
+        await updateClaudeProviderMutation.mutateAsync(
+          buildBatchProviderUpdate(matchedProvider, provider),
+        );
+        return;
+      }
+      await addClaudeProviderMutation.mutateAsync(provider);
+      return;
+    }
+
+    if (appId === "codex") {
+      if (matchedProvider) {
+        if (isSameBatchProviderContent(matchedProvider, provider)) {
+          return;
+        }
+        await updateCodexProviderMutation.mutateAsync(
+          buildBatchProviderUpdate(matchedProvider, provider),
+        );
+        return;
+      }
+      await addCodexProviderMutation.mutateAsync(provider);
+      return;
+    }
+
+    throw new Error(`Unsupported batch add app: ${appId}`);
+  };
 
   const disableOmoMutation = useDisableCurrentOmo();
   const handleDisableOmo = () => {
@@ -1232,13 +1303,27 @@ function App() {
                       </AnimatePresence>
                     </div>
 
-                    <Button
-                      onClick={() => setIsAddOpen(true)}
-                      size="icon"
-                      className={`ml-2 ${addActionButtonClass}`}
-                    >
-                      <Plus className="w-5 h-5" />
-                    </Button>
+                    <div className="ml-2 flex items-center gap-1.5">
+                      <Button
+                        onClick={() => setIsAddOpen(true)}
+                        size="icon"
+                        className={addActionButtonClass}
+                        title={t("header.addProvider")}
+                      >
+                        <Plus className="w-5 h-5" />
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setIsBatchAddOpen(true)}
+                        className="border-border-default bg-background/80 hover:bg-accent"
+                      >
+                        <Download className="w-4 h-4" />
+                        {t("provider.batchAdd", {
+                          defaultValue: "Batch Add",
+                        })}
+                      </Button>
+                    </div>
                   </>
                 )}
               </div>
@@ -1259,6 +1344,13 @@ function App() {
         onOpenChange={setIsAddOpen}
         appId={activeApp}
         onSubmit={addProvider}
+      />
+
+      <BatchAddProvidersDialog
+        open={isBatchAddOpen}
+        onOpenChange={setIsBatchAddOpen}
+        appId={activeApp}
+        onSubmit={addBatchProvider}
       />
 
       <EditProviderDialog

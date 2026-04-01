@@ -17,6 +17,11 @@ export interface ProviderSwitchEvent {
   providerId: string;
 }
 
+export interface RemoteProviderModel {
+  id: string;
+  name?: string;
+}
+
 export interface SwitchResult {
   warnings: string[];
 }
@@ -130,6 +135,13 @@ export const providersApi = {
    */
   async importOpenClawFromLive(): Promise<number> {
     return await invoke("import_openclaw_providers_from_live");
+  },
+
+  async fetchSourceModels(
+    baseUrl: string,
+    apiKey: string,
+  ): Promise<RemoteProviderModel[]> {
+    return await invoke("fetch_provider_source_models", { baseUrl, apiKey });
   },
 };
 

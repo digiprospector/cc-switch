@@ -1,4 +1,5 @@
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::app_config::AppType;
@@ -10,10 +11,78 @@ use crate::services::{
 };
 use crate::store::AppState;
 use std::str::FromStr;
+use std::time::Duration;
 
 // 常量定义
 const TEMPLATE_TYPE_GITHUB_COPILOT: &str = "github_copilot";
 const COPILOT_UNIT_PREMIUM: &str = "requests";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProviderModel {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+fn preview_for_log(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    let mut preview = trimmed.chars().take(max_chars).collect::<String>();
+    if trimmed.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn build_model_urls(base_url: &str) -> Vec<String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if trimmed.ends_with("/models") {
+        return vec![trimmed.to_string()];
+    }
+
+    if trimmed.contains("/v1") {
+        return vec![format!("{trimmed}/models")];
+    }
+
+    vec![format!("{trimmed}/v1/models"), format!("{trimmed}/models")]
+}
+
+fn parse_remote_models(payload: &serde_json::Value) -> Result<Vec<RemoteProviderModel>, String> {
+    let data = payload
+        .get("data")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "Model response missing data array".to_string())?;
+
+    let mut models = Vec::new();
+    for item in data {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| "Model entry missing id".to_string())?;
+
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned);
+
+        models.push(RemoteProviderModel {
+            id: id.to_string(),
+            name,
+        });
+    }
+
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    Ok(models)
+}
 
 /// 获取所有供应商
 #[tauri::command]
@@ -142,6 +211,102 @@ pub fn import_default_config_test_hook(
 pub fn import_default_config(state: State<'_, AppState>, app: String) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     import_default_config_internal(&state, app_type).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn fetch_provider_source_models(
+    #[allow(non_snake_case)] baseUrl: String,
+    #[allow(non_snake_case)] apiKey: String,
+) -> Result<Vec<RemoteProviderModel>, String> {
+    let urls = build_model_urls(&baseUrl);
+    if urls.is_empty() {
+        log::warn!("[BatchAdd] fetch_provider_source_models: empty base URL");
+        return Err("Base URL is empty".to_string());
+    }
+
+    log::info!(
+        "[BatchAdd] Fetching remote models for baseUrl='{}' with {} candidate URL(s), apiKey_present={}, apiKey_length={}",
+        baseUrl.trim(),
+        urls.len(),
+        !apiKey.trim().is_empty(),
+        apiKey.chars().count()
+    );
+    log::debug!("[BatchAdd] Candidate model URLs: {:?}", urls);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+    let mut last_error = None;
+
+    for url in urls {
+        log::info!("[BatchAdd] GET {url}");
+        match client
+            .get(&url)
+            .bearer_auth(&apiKey)
+            .header("accept", "application/json")
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                log::info!("[BatchAdd] Response {status} for {url}");
+
+                if !status.is_success() {
+                    let response_text = response.text().await.unwrap_or_default();
+                    let response_preview = preview_for_log(&response_text, 4000);
+                    log::warn!(
+                        "[BatchAdd] Non-success response from {url}: status={}, body='{}'",
+                        status,
+                        response_preview
+                    );
+                    last_error = Some(format!("{status} {url} | body: {response_preview}"));
+                    continue;
+                }
+
+                let response_text = response
+                    .text()
+                    .await
+                    .map_err(|e| format!("Failed to read model response body: {e}"))?;
+                log::info!(
+                    "[BatchAdd] Response body from {url}: '{}'",
+                    preview_for_log(&response_text, 4000)
+                );
+
+                let payload = serde_json::from_str::<serde_json::Value>(&response_text).map_err(
+                    |e| {
+                        let response_preview = preview_for_log(&response_text, 4000);
+                        log::warn!(
+                            "[BatchAdd] Failed to parse JSON from {url}: {e}; body='{}'",
+                            response_preview
+                        );
+                        format!("Failed to parse model response: {e}; body: {response_preview}")
+                    },
+                )?;
+
+                let models = parse_remote_models(&payload).map_err(|e| {
+                    log::warn!(
+                        "[BatchAdd] Failed to extract models from {url}: {e}; payload='{}'",
+                        preview_for_log(&payload.to_string(), 400)
+                    );
+                    e
+                })?;
+
+                log::info!("[BatchAdd] Parsed {} model(s) from {url}", models.len());
+                return Ok(models);
+            }
+            Err(error) => {
+                log::warn!("[BatchAdd] Request failed for {url}: {error}");
+                last_error = Some(format!("{} ({url})", error));
+            }
+        }
+    }
+
+    let error_message =
+        last_error.unwrap_or_else(|| "Failed to fetch remote models".to_string());
+    log::warn!("[BatchAdd] Fetch remote models failed: {error_message}");
+    Err(error_message)
 }
 
 #[allow(non_snake_case)]
@@ -406,6 +571,72 @@ pub fn get_opencode_live_provider_ids() -> Result<Vec<String>, String> {
     crate::opencode_config::get_providers()
         .map(|providers| providers.keys().cloned().collect())
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn build_model_urls_supports_common_openai_variants() {
+        assert_eq!(
+            build_model_urls("https://api.example.com"),
+            vec![
+                "https://api.example.com/v1/models".to_string(),
+                "https://api.example.com/models".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            build_model_urls("https://api.example.com/v1/"),
+            vec!["https://api.example.com/v1/models".to_string()]
+        );
+
+        assert_eq!(
+            build_model_urls("https://api.example.com/models"),
+            vec!["https://api.example.com/models".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_remote_models_sorts_dedupes_and_keeps_name() {
+        let payload = json!({
+            "data": [
+                { "id": "gpt-5.4", "name": "GPT 5.4" },
+                { "id": "claude-sonnet-4.5" },
+                { "id": "gpt-5.4", "name": "Duplicate" }
+            ]
+        });
+
+        let models = parse_remote_models(&payload).expect("models should parse");
+
+        assert_eq!(
+            models,
+            vec![
+                RemoteProviderModel {
+                    id: "claude-sonnet-4.5".to_string(),
+                    name: None,
+                },
+                RemoteProviderModel {
+                    id: "gpt-5.4".to_string(),
+                    name: Some("GPT 5.4".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_remote_models_requires_data_array_and_model_id() {
+        assert!(parse_remote_models(&json!({})).is_err());
+
+        assert!(parse_remote_models(&json!({
+            "data": [
+                { "name": "No id" }
+            ]
+        }))
+        .is_err());
+    }
 }
 
 // ============================================================================

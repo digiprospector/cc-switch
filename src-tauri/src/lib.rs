@@ -843,6 +843,7 @@ pub fn run() {
             commands::remove_provider_from_live_config,
             commands::switch_provider,
             commands::import_default_config,
+            commands::fetch_provider_source_models,
             commands::get_claude_config_status,
             commands::get_config_status,
             commands::get_claude_code_config_path,
